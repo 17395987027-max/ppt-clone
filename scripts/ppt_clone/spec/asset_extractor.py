@@ -8,16 +8,23 @@ Extracts and CLASSIFIES visual assets:
   - CONTENT_IMAGE: Photos, screenshots in content area (DISCARD — content-dependent)
 
 Classification rules:
-  - area < 3% + in margin → ICON
-  - area < 15% + not main content → DECORATION
-  - chart/table shapes → DISCARD
-  - everything else in content zone → DISCARD
+  - chart/table shapes           → DISCARD
+  - area < 3%                    → ICON
+  - 3% ≤ area < 15%              → DECORATION
+  - 15% ≤ area < 88%             → DECORATION (a framed photo block the
+                                    layout is built around — not throwaway)
+  - area ≥ 88%                   → BACKGROUND (a full-bleed ground)
+
+Each kept asset also carries HOW it is used (``usage`` = background / hero /
+decoration / icon, refined to mockup_frame / inset when one picture nests in
+another via annotate_contains) plus ``crop`` (srcRect crop / stretched-to-fit).
 
 All kept assets saved to specs/<name>/assets/.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import re
 from dataclasses import dataclass
@@ -48,6 +55,12 @@ class AssetInfo:
     shape_name: str = ""
     position: dict = None
     size_ratio: float = 0.0  # fraction of slide area
+    # How the picture is used: background | hero | decoration | icon — refined
+    # to mockup_frame / inset when one picture sits inside another.
+    usage: str = ""
+    contains: str = ""       # src of the picture framed by this one
+    inside: str = ""         # src of the frame this picture sits in
+    crop: dict = None        # {"cropped": bool, "stretched": bool}
 
     def to_dict(self) -> dict:
         d = {"type": self.type.value, "src": self.src, "description": self.description}
@@ -55,7 +68,31 @@ class AssetInfo:
             d["shape_name"] = self.shape_name
         if self.position:
             d["position"] = self.position
+        if self.usage:
+            d["usage"] = self.usage
+        if self.contains:
+            d["contains"] = self.contains
+        if self.inside:
+            d["inside"] = self.inside
+        if self.crop:
+            d["crop"] = self.crop
         return d
+
+
+# A picture covering this much of the canvas is the page's ground, not a prop.
+BACKGROUND_RATIO = 0.88
+
+
+def usage_for(ratio: float) -> str:
+    """Label a picture by the share of the canvas it covers."""
+    if ratio >= BACKGROUND_RATIO:
+        return "background"
+    if ratio >= 0.15:
+        return "hero"
+    if ratio >= 0.03:
+        return "decoration"
+    return "icon"
+
 
 
 # ── Classification ────────────────────────────────────────────────────
@@ -68,11 +105,13 @@ def classify_image(img_w_emu: int, img_h_emu: int,
     """Classify an image asset based on size and position.
 
     Uses heuristics:
-        - Charts/tables    → DISCARD
-        - < 3% slide area  → ICON (if in margins)
-        - < 15% slide area → DECORATION
-        - > 50% slide area → BACKGROUND
-        - Everything else  → CONTENT_IMAGE (discard)
+        - Charts/tables       → DISCARD
+        - < 3% slide area     → ICON (if named like one) / DECORATION
+        - < 15% slide area    → DECORATION
+        - ≥ 88% slide area    → BACKGROUND (a full-bleed ground)
+        - 15–88% slide area   → DECORATION (a framed photo block belongs to
+          the layout — throwing it away loses the design)
+        - Everything else     → CONTENT_IMAGE (discard)
     """
     if is_chart_shape:
         return AssetType.CHART
@@ -98,9 +137,13 @@ def classify_image(img_w_emu: int, img_h_emu: int,
             return AssetType.ICON
         return AssetType.DECORATION
 
-    # Very large → background
-    if ratio > 0.5:
+    # Full-bleed → the page's ground
+    if ratio >= BACKGROUND_RATIO:
         return AssetType.BACKGROUND
+
+    # Large but not full-bleed: a photo block the layout is built around.
+    if ratio >= 0.15:
+        return AssetType.DECORATION
 
     # Medium size in content area → content image (discard)
     return AssetType.CONTENT_IMAGE
@@ -271,15 +314,22 @@ def _extract_blip(blip_fill: etree._Element, part, spec_dir: Path,
 
 def extract_shape_assets(shape, spec_dir: Path, page_idx: int,
                           slide_w_emu: int = 0, slide_h_emu: int = 0,
-                          img_counter: list[int] | None = None
+                          img_counter: list[int] | None = None,
+                          seen: dict | None = None
                           ) -> list[AssetInfo]:
     """Extract and classify images from a shape (Picture, image fill, group children).
 
     Only keeps: BACKGROUND, ICON, DECORATION.
     Discards: CHART, CONTENT_IMAGE.
+
+    ``img_counter`` is shared by the caller so names stay unique across a page;
+    ``seen`` maps a blob hash to an already-saved src, so one picture reused by
+    many shapes is written once.
     """
     if img_counter is None:
         img_counter = [0]
+    if seen is None:
+        seen = {}
     results: list[AssetInfo] = []
 
     # Direct Picture shapes
@@ -287,7 +337,8 @@ def extract_shape_assets(shape, spec_dir: Path, page_idx: int,
         from pptx.shapes.picture import Picture
         if isinstance(shape, Picture):
             asset = _extract_picture_asset(shape, spec_dir, page_idx,
-                                            img_counter, slide_w_emu, slide_h_emu)
+                                            img_counter, slide_w_emu, slide_h_emu,
+                                            seen)
             if asset and asset.type in (AssetType.BACKGROUND, AssetType.ICON,
                                          AssetType.DECORATION):
                 results.append(asset)
@@ -311,7 +362,8 @@ def extract_shape_assets(shape, spec_dir: Path, page_idx: int,
             from pptx.enum.dml import MSO_FILL_TYPE
             if shape.fill.type == MSO_FILL_TYPE.PICTURE:
                 asset = _extract_fill_asset(shape, spec_dir, page_idx,
-                                             img_counter, slide_w_emu, slide_h_emu)
+                                             img_counter, slide_w_emu, slide_h_emu,
+                                             seen)
                 if asset and asset.type in (AssetType.BACKGROUND, AssetType.ICON,
                                              AssetType.DECORATION):
                     results.append(asset)
@@ -323,7 +375,8 @@ def extract_shape_assets(shape, spec_dir: Path, page_idx: int,
         if hasattr(shape, "shapes"):
             for child in shape.shapes:
                 child_results = extract_shape_assets(
-                    child, spec_dir, page_idx, slide_w_emu, slide_h_emu, img_counter
+                    child, spec_dir, page_idx, slide_w_emu, slide_h_emu,
+                    img_counter, seen
                 )
                 results.extend(child_results)
     except Exception:
@@ -334,7 +387,8 @@ def extract_shape_assets(shape, spec_dir: Path, page_idx: int,
 
 def _extract_picture_asset(picture, spec_dir: Path, page_idx: int,
                             img_counter: list[int],
-                            slide_w_emu: int, slide_h_emu: int) -> AssetInfo | None:
+                            slide_w_emu: int, slide_h_emu: int,
+                            seen: dict | None = None) -> AssetInfo | None:
     """Extract and classify a Picture shape."""
     try:
         image = picture.image
@@ -353,38 +407,220 @@ def _extract_picture_asset(picture, spec_dir: Path, page_idx: int,
         if asset_type in (AssetType.CHART, AssetType.CONTENT_IMAGE):
             return AssetInfo(type=asset_type, src="", description=f"[DISCARDED] {picture.name}")
 
-        # Save
+        ratio = ((picture.width or 0) * (picture.height or 0)) / (slide_w_emu * slide_h_emu) if slide_w_emu and slide_h_emu else 0.0
+        usage = usage_for(ratio)
+        crop = _describe_crop(picture, blob, ext)
+
+        # Save (reuse an identical already-saved blob)
         assets_dir = spec_dir / "assets"
         assets_dir.mkdir(parents=True, exist_ok=True)
-        prefix = asset_type.value[:3]  # "ico", "dec", "bac"
-        n = img_counter[0]
-        img_counter[0] += 1
-        filename = f"{prefix}_{page_idx:02d}_{n:02d}.{ext}"
-        (assets_dir / filename).write_bytes(blob)
+        prefix = {"background": "bac", "hero": "pho", "decoration": "dec",
+                  "icon": "ico"}.get(usage, "dec")
+        digest = hashlib.sha1(blob).hexdigest()
+        if seen is not None and digest in seen:
+            filename = seen[digest]
+        else:
+            n = img_counter[0]
+            img_counter[0] += 1
+            filename = f"{prefix}_{page_idx:02d}_{n:02d}.{ext}"
+            (assets_dir / filename).write_bytes(blob)
+            if seen is not None:
+                seen[digest] = filename
 
         x = (picture.left or 0) / 914400
         y = (picture.top or 0) / 914400
         w = (picture.width or 0) / 914400
         h = (picture.height or 0) / 914400
 
+        detail = f"{usage} ({w:.1f}x{h:.1f}in, at {x:.1f},{y:.1f}, {ratio:.0%} of canvas)"
+        if crop.get("cropped"):
+            detail += ", cropped"
+        if crop.get("stretched"):
+            detail += ", stretched to fit"
+
         return AssetInfo(
             type=asset_type,
             src=f"assets/{filename}",
             shape_name=picture.name,
             position={"x": round(x, 2), "y": round(y, 2), "w": round(w, 2), "h": round(h, 2)},
-            description=f"{asset_type.value}: {filename} ({w:.1f}x{h:.1f}in, at {x:.1f},{y:.1f})",
-            size_ratio=((picture.width or 0) * (picture.height or 0)) / (slide_w_emu * slide_h_emu) if slide_w_emu and slide_h_emu else 0,
+            description=f"{asset_type.value}: {filename} — {detail}",
+            size_ratio=ratio,
+            usage=usage,
+            crop=crop,
         )
     except Exception:
         return None
 
 
+def extract_page_background(slide, spec_dir: Path, page_idx: int,
+                            slide_w_emu: int, slide_h_emu: int) -> dict[str, Any] | None:
+    """Find the image that grounds this page.
+
+    A background set through ``<p:bg>`` is handled elsewhere. Plenty of decks
+    instead lay a full-bleed image on the slide, the layout or the master — as
+    a picture, a picture inside a group, or a shape with a picture fill.
+    Without this check such a page is described as white and the replica comes
+    out with no ground at all.
+
+    Returns a background dict (same shape as extract_background_image) or None.
+    """
+    if not slide_w_emu or not slide_h_emu:
+        return None
+    try:
+        from pptx.shapes.picture import Picture
+    except ImportError:
+        return None
+
+    def _blob_of(shape):
+        """Return (blob, content_type) for a picture or a picture-filled shape."""
+        if isinstance(shape, Picture):
+            try:
+                return shape.image.blob, shape.image.content_type
+            except Exception:
+                return None
+        # A shape whose fill is an image — walk its own blipFill relationship.
+        try:
+            match = re.search(r'<a:blip[^>]*r:embed="([^"]*)"', shape._element.xml)
+            if not match:
+                return None
+            rel = shape.part.rels.get(match.group(1))
+            if not rel:
+                return None
+            return rel.target_part.blob, rel.target_part.content_type
+        except Exception:
+            return None
+
+    def _scan(shapes, source: str):
+        for shape in shapes:
+            try:
+                ratio = ((shape.width or 0) * (shape.height or 0)) / (slide_w_emu * slide_h_emu)
+            except Exception:
+                ratio = 0.0
+            # Group shapes: the ground is often nested one level in.
+            if hasattr(shape, "shapes") and not isinstance(shape, Picture):
+                try:
+                    found = _scan(shape.shapes, source)
+                    if found:
+                        return found
+                except Exception:
+                    pass
+                continue
+            if ratio < BACKGROUND_RATIO:
+                continue
+            got = _blob_of(shape)
+            if not got:
+                continue
+            blob, content_type = got
+            ext = _content_type_to_ext(content_type)
+            assets_dir = spec_dir / "assets"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"bg_{page_idx:03d}.{ext}"
+            (assets_dir / filename).write_bytes(blob)
+            return {
+                "type": "image",
+                "color": "",
+                "image": f"assets/{filename}",
+                "description": (f"Full-bleed background image "
+                                f"({ratio:.0%} of the canvas, from the {source})"),
+            }
+        return None
+
+    for source, shapes in _background_sources(slide):
+        found = _scan(shapes, source)
+        if found:
+            return found
+    return None
+
+
+def _background_sources(slide):
+    """Layers to search for a ground, in front-to-back order."""
+    sources = [("slide", slide.shapes)]
+    try:
+        sources.append(("layout", slide.slide_layout.shapes))
+        sources.append(("master", slide.slide_layout.slide_master.shapes))
+    except Exception:
+        pass
+    return sources
+
+
+def _describe_crop(picture, blob: bytes, ext: str) -> dict[str, bool]:
+    """Say whether a picture is cropped (srcRect) or distorted to fit."""
+    cropped = False
+    try:
+        src_rect = picture._element.find(f".//{{{A_NS}}}blipFill/{{{A_NS}}}srcRect")
+        if src_rect is not None:
+            cropped = any(int(src_rect.get(k) or 0) != 0 for k in ("l", "t", "r", "b"))
+    except Exception:
+        pass
+
+    stretched = False
+    try:
+        from PIL import Image
+        nat_w, nat_h = Image.open(io.BytesIO(blob)).size
+        if nat_w and nat_h and picture.width and picture.height:
+            native = nat_w / nat_h
+            placed = picture.width / picture.height
+            stretched = abs(placed - native) / native > 0.02
+    except Exception:
+        pass
+
+    return {"cropped": cropped, "stretched": stretched}
+
+
+def annotate_contains(assets: list, tol: float = 0.15) -> None:
+    """Mark pictures that sit inside another picture (a photo in a mockup).
+
+    The outer picture is the frame — a laptop, a phone, a card — and the inner
+    one is the content shown in it. Knowing both makes the page reproducible:
+    draw the frame, then drop the photo into its opening.
+
+    A full-bleed ground (``usage == "background"``) wraps everything on the
+    page, so it is never a frame — excluding it keeps the real mockup pair.
+    """
+    def box(a: AssetInfo) -> tuple[float, float, float, float]:
+        p = a.position or {}
+        return (p.get("x", 0.0), p.get("y", 0.0), p.get("w", 0.0), p.get("h", 0.0))
+
+    def is_ground(a: AssetInfo) -> bool:
+        return a.type == AssetType.BACKGROUND or a.usage == "background"
+
+    for inner in assets:
+        if (not inner.src or is_ground(inner)
+                or inner.type == AssetType.ICON or inner.usage == "icon"):
+            continue
+        ix, iy, iw, ih = box(inner)
+        best = None
+        for outer in assets:
+            if outer is inner or not outer.src or outer.inside or outer.contains:
+                continue
+            if is_ground(outer) or outer.type == AssetType.ICON:
+                continue
+            ox, oy, ow, oh = box(outer)
+            if ow * oh <= iw * ih * 1.1:
+                continue
+            # A genuine inset fills a real opening, not a sliver of the frame.
+            if iw * ih < 0.10 * ow * oh:
+                continue
+            if (ox - tol <= ix and oy - tol <= iy
+                    and ox + ow + tol >= ix + iw and oy + oh + tol >= iy + ih):
+                if best is None or ow * oh < box(best)[2] * box(best)[3]:
+                    best = outer
+        if best is not None:
+            inner.inside = best.src
+            inner.usage = "inset"
+            best.contains = inner.src
+            best.usage = "mockup_frame"
+
+
 def _extract_fill_asset(shape, spec_dir: Path, page_idx: int,
                          img_counter: list[int],
-                         slide_w_emu: int, slide_h_emu: int) -> AssetInfo | None:
+                         slide_w_emu: int, slide_h_emu: int,
+                         seen: dict | None = None) -> AssetInfo | None:
     """Extract and classify a shape's image fill."""
     try:
         # Classify first
+        ratio = (((shape.width or 0) * (shape.height or 0)) / (slide_w_emu * slide_h_emu)
+                 if slide_w_emu and slide_h_emu else 0.0)
         asset_type = classify_image(
             img_w_emu=(shape.width or 0),
             img_h_emu=(shape.height or 0),
@@ -411,13 +647,21 @@ def _extract_fill_asset(shape, spec_dir: Path, page_idx: int,
         blob = image.blob
         ext = _content_type_to_ext(image.content_type)
 
+        usage = usage_for(ratio)
+        prefix = {"background": "bac", "hero": "pho", "decoration": "dec",
+                  "icon": "ico"}.get(usage, "dec")
         assets_dir = spec_dir / "assets"
         assets_dir.mkdir(parents=True, exist_ok=True)
-        prefix = asset_type.value[:3]
-        n = img_counter[0]
-        img_counter[0] += 1
-        filename = f"{prefix}_{page_idx:02d}_{n:02d}.{ext}"
-        (assets_dir / filename).write_bytes(blob)
+        digest = hashlib.sha1(blob).hexdigest()
+        if seen is not None and digest in seen:
+            filename = seen[digest]
+        else:
+            n = img_counter[0]
+            img_counter[0] += 1
+            filename = f"{prefix}_{page_idx:02d}_{n:02d}.{ext}"
+            (assets_dir / filename).write_bytes(blob)
+            if seen is not None:
+                seen[digest] = filename
 
         x = (shape.left or 0) / 914400
         y = (shape.top or 0) / 914400
@@ -429,8 +673,9 @@ def _extract_fill_asset(shape, spec_dir: Path, page_idx: int,
             src=f"assets/{filename}",
             shape_name=shape.name,
             position={"x": round(x, 2), "y": round(y, 2), "w": round(w, 2), "h": round(h, 2)},
-            description=f"{asset_type.value}: {filename} (fill in '{shape.name}')",
-            size_ratio=((shape.width or 0) * (shape.height or 0)) / (slide_w_emu * slide_h_emu) if slide_w_emu and slide_h_emu else 0,
+            description=f"{asset_type.value}: {filename} — {usage} (fill in '{shape.name}')",
+            size_ratio=ratio,
+            usage=usage,
         )
     except Exception:
         return None

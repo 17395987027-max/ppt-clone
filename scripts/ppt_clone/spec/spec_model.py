@@ -210,6 +210,9 @@ class Element:
     visible: bool = True
     shape_name: str = ""            # Original PowerPoint shape name
     from_layout: bool = False        # inherited from the slide layout (behind slide shapes)
+    # How an image element earns its place: background | hero | decoration |
+    # icon | mockup_frame | inset ('' for anything that is not an image).
+    usage: str = ""
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -233,6 +236,8 @@ class Element:
             d["children"] = [c.to_dict() for c in self.children]
         if self.shape_name:
             d["shape_name"] = self.shape_name
+        if self.usage:
+            d["usage"] = self.usage
         return d
 
 
@@ -265,6 +270,10 @@ class PageSpec:
     # Elements
     elements: list[Element] = field(default_factory=list)
 
+    # Extracted image assets and how each one is used (background / hero /
+    # decoration / icon / mockup frame), with the geometry that proves it.
+    assets: list[dict] = field(default_factory=list)
+
     # Descriptive
     layout_description: str = ""
 
@@ -292,10 +301,27 @@ class PageSpec:
             "visual_hierarchy": self.visual_hierarchy,
             "layout_description": self.layout_description,
             "elements": [e.to_dict() for e in self.elements],
+            **({"assets": self.assets} if self.assets else {}),
         }
 
 
 # ── Color & Typography ──────────────────────────────────────────────
+
+
+def is_neutral_color(hex_color: str) -> bool:
+    """True for white / black / grey — colours with no usable hue.
+
+    Brand palettes are picked from the *chromatic* colours a deck uses, so
+    near-white backgrounds and near-black text must not crowd them out.
+    """
+    h = (hex_color or "").lstrip("#")
+    if len(h) != 6:
+        return True
+    try:
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return True
+    return (max(r, g, b) - min(r, g, b)) < 12
 
 
 @dataclass
@@ -312,6 +338,10 @@ class ColorPalette:
     light2: str = ""
     hyperlink: str = ""
     followed_hyperlink: str = ""
+    # Colours the deck actually applies, ranked by area covered. Many decks
+    # ship the stock Office theme and put the real brand colours straight into
+    # shape fills, so the scheme alone can be misleading.
+    dominant: list = field(default_factory=list)
 
     # Backward-compat aliases
     @property
@@ -350,6 +380,33 @@ class ColorPalette:
             hyperlink=scheme_colors.get("hlink", ""),
             followed_hyperlink=scheme_colors.get("folHlink", ""),
         )
+
+    def apply_dominant(self, ranked: list) -> None:
+        """Record the deck's real colours and remap accents when needed.
+
+        `ranked` is [(hex, score)] from extract_used_colors(). The theme's
+        clrScheme only says what the deck *could* use; if none of its accents
+        actually show up on a slide, the scheme is dead weight (a stock Office
+        theme on a hand-coloured deck) and the measured colours are the honest
+        answer — so the accents are replaced by them.
+        """
+        self.dominant = [hexv for hexv, _ in ranked[:8]]
+        brand = [hexv for hexv, _ in ranked if not is_neutral_color(hexv)][:8]
+        if not brand:
+            return
+        scheme_accents = {
+            self.accent1, self.accent2, self.accent3,
+            self.accent4, self.accent5, self.accent6,
+        } - {""}
+        if scheme_accents & set(brand):
+            return  # the scheme's accents really are on the slides — keep them
+        # dk2/lt2 come from the same unused scheme, so they are just as phantom.
+        self.dark2 = ""
+        self.light2 = ""
+        for i in range(6):
+            # Blank the slots we have no real colour for — leaving the stock
+            # Office greens and purples behind would be worse than nothing.
+            setattr(self, f"accent{i + 1}", brand[i] if i < len(brand) else "")
 
 
 @dataclass

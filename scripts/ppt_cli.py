@@ -40,6 +40,11 @@ def cmd_extract_spec(args: argparse.Namespace) -> int:
 
     print(f"Spec saved: specs/{spec.metadata.get('name', 'spec')}/")
     print(f"  Colors: {len(spec.palette.to_dict())} palette entries")
+    dominant = getattr(spec.palette, "dominant", None)
+    if dominant:
+        # What the slides actually paint with, ranked by area — the honest
+        # answer when the deck ships a stock theme and colours its own shapes.
+        print(f"  In use: {', '.join(dominant[:5])}")
     print(f"  Fonts: {spec.typography.heading_family or 'unknown'} / "
           f"{spec.typography.body_family or 'unknown'}")
     print(f"  Pages: {len(spec.pages)} → {', '.join(spec.page_types_found)}")

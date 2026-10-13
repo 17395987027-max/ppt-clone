@@ -87,10 +87,13 @@ def _build_generation_prompt(
     # Spec style guidance
     bg_color = spec_page.get("background_color", "#FFFFFF")
     bg_description = spec_page.get("background_description", "Plain white background")
+    background = spec_page.get("background", {}) or {}
+    bg_image = background.get("image", "") or spec_page.get("background_image", "")
     layout_description = spec_page.get("layout_description", "")
     colors = spec_page.get("colors", {})
     typography = spec_page.get("typography", {})
     assets_dir = spec_page.get("assets_dir", "")
+    page_assets = spec_page.get("assets", [])
     design_patterns = spec_page.get("design_patterns", [])
     element_groups = spec_page.get("element_groups", [])
     elements = spec_page.get("elements", [])
@@ -148,10 +151,44 @@ def _build_generation_prompt(
         for g in element_groups[:5]:
             group_guide += f"  - [{','.join(str(i) for i in g.get('element_ids',[]))}] role={g.get('group_role','')}: {g.get('description','')}\n"
 
+    # ── Background instruction ──
+    if bg_image:
+        bg_instruction = (
+            f"{bg_description}. FIRST draw the page ground as a full-bleed "
+            f"<image> covering the whole canvas (x=0, y=0, width=1280, "
+            f"height=720) referencing {bg_image}; everything else goes on top."
+        )
+    else:
+        bg_instruction = (
+            f"{bg_description}. Background color: {bg_color}. "
+            f"Use a full-size <rect> for the background."
+        )
+
     # ── Asset info ──
     asset_guide = ""
-    if assets_dir:
+    if page_assets:
+        asset_guide = ("Assets on this page (how each is USED — place them the same way):\n")
+        for a in page_assets[:12]:
+            src = a.get("src", "")
+            usage = a.get("usage", "") or a.get("type", "asset")
+            note = usage
+            if a.get("inside"):
+                note += f", sits INSIDE {a['inside']} (draw the frame first, then this in its opening)"
+            elif a.get("contains"):
+                note += f", is a FRAME holding {a['contains']}"
+            crop = a.get("crop") or {}
+            if crop.get("cropped"):
+                note += ", cropped by the source"
+            if crop.get("stretched"):
+                note += ", stretched to fill its box"
+            pos = a.get("position") or {}
+            where = (f" at ({pos.get('x',0):.2f},{pos.get('y',0):.2f}) "
+                     f"size {pos.get('w',0):.2f}x{pos.get('h',0):.2f}in") if pos else ""
+            asset_guide += f"  - {src} — {note}{where}\n"
+    elif assets_dir:
         asset_guide = f"Reusable assets directory: {assets_dir}/"
+    if assets_dir and page_assets:
+        asset_guide += f"  (files live in {assets_dir}/)"
 
     prompt = f"""Generate an SVG slide that faithfully reproduces the reference layout described below.
 
@@ -171,7 +208,7 @@ The source PPT slide has these elements arranged in this layout:
 {asset_guide}
 
 ## Visual Style (MUST MATCH)
-1. **Background**: {bg_description}. Background color: {bg_color}. Use a full-size <rect> for background.
+1. **Background**: {bg_instruction}
 2. **Color Palette** (use ONLY these hex colors):
 {color_guide}
 3. **Typography**: Use ONLY font-family="{font_family}". Title size 28-36pt, body 14-18pt.

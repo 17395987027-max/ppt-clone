@@ -395,4 +395,99 @@ __all__ = [
     "extract_theme_colors",
     "extract_theme_fonts",
     "extract_slide_background",
+    "extract_used_colors",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Colours actually applied on the slides
+# ---------------------------------------------------------------------------
+
+_SHAPE_TAGS = {"sp", "pic", "graphicFrame", "bg", "bgPr", "grpSp", "cxnSp"}
+
+
+def _solid_fill_color(fill_elem: etree._Element, scheme_map: dict[str, str]) -> str | None:
+    """Resolve the colour child of one <a:solidFill> to HEX."""
+    for child in fill_elem:
+        tag = etree.QName(child.tag).localname
+        if tag == "schemeClr":
+            return scheme_map.get(child.get("val") or "", None)
+        if tag in ("srgbClr", "sysClr"):
+            return _resolve_color_element(child)
+    return None
+
+
+def _shape_area_emu(shape_elem: etree._Element) -> float:
+    """Area (EMU²) of a shape, or 0 when it has no extent."""
+    for xfrm in shape_elem.iter(f"{{{A_NS}}}xfrm"):
+        ext = xfrm.find(f"{{{A_NS}}}ext")
+        if ext is not None:
+            try:
+                return float(ext.get("cx") or 0) * float(ext.get("cy") or 0)
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
+def extract_used_colors(
+    pptx_path: str,
+    scheme_map: dict[str, str] | None = None,
+    top_n: int = 8,
+) -> list[tuple[str, float]]:
+    """Rank the colours a deck actually applies, by area covered.
+
+    The theme's clrScheme lists what the deck *could* use; this reads what it
+    does use. Every slide, layout and master is scanned for solid fills (shape
+    fill, line, text run, gradient stop), each schemeClr resolved through
+    scheme_map, and each hit scored by the area of the shape carrying it — so
+    a full-bleed block outranks a small accent dot.
+
+    Returns [(hex, score)] sorted by score descending (empty on failure).
+    """
+    scheme_map = scheme_map or {}
+    scores: dict[str, float] = {}
+    try:
+        with zipfile.ZipFile(pptx_path) as zf:
+            parts = [
+                n for n in zf.namelist()
+                if n.endswith(".xml")
+                and n.startswith((
+                    "ppt/slides/slide",
+                    "ppt/slideLayouts/slideLayout",
+                    "ppt/slideMasters/slideMaster",
+                ))
+            ]
+            slide_area = _slide_area_emu(zf)
+            for part in parts:
+                try:
+                    root = etree.fromstring(zf.read(part))
+                except (etree.XMLSyntaxError, KeyError):
+                    continue
+                for elem in root.iter():
+                    localname = etree.QName(elem.tag).localname
+                    if localname not in _SHAPE_TAGS:
+                        continue
+                    # A background fills the whole slide; a shape its own box.
+                    if localname in ("bg", "bgPr"):
+                        area = slide_area
+                    else:
+                        area = _shape_area_emu(elem) or 1.0
+                    for fill in elem.iter(f"{{{A_NS}}}solidFill"):
+                        hexv = _solid_fill_color(fill, scheme_map)
+                        if hexv:
+                            scores[hexv] = scores.get(hexv, 0.0) + area
+    except (zipfile.BadZipFile, OSError):
+        return []
+    return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+
+
+def _slide_area_emu(zf: zipfile.ZipFile) -> float:
+    """Slide area in EMU², from ppt/presentation.xml (fallback: 16:9)."""
+    try:
+        root = etree.fromstring(zf.read("ppt/presentation.xml"))
+        sld_sz = root.find(f"{{{P_NS}}}sldSz")
+        if sld_sz is not None:
+            return float(sld_sz.get("cx") or 0) * float(sld_sz.get("cy") or 0)
+    except (KeyError, etree.XMLSyntaxError):
+        pass
+    return 12192000.0 * 6858000.0

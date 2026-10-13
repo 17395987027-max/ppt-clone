@@ -123,6 +123,7 @@ def _load_spec_pages(spec_dir: Path) -> tuple[list[dict], dict]:
                                 if data:
                                     data["page_type"] = page_type
                                     data["layout_sub_type"] = layout_sub_type
+                                    data["assets_dir"] = str(spec_dir / "assets")
                                     spec_pages.append(data)
                             except Exception:
                                 pass
@@ -133,6 +134,7 @@ def _load_spec_pages(spec_dir: Path) -> tuple[list[dict], dict]:
                         if data:
                             data["page_type"] = page_type
                             data["layout_sub_type"] = ""
+                            data["assets_dir"] = str(spec_dir / "assets")
                             spec_pages.append(data)
                     except Exception:
                         pass

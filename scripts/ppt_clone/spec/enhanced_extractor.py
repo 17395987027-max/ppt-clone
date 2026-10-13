@@ -30,7 +30,12 @@ from ppt_clone.spec.spec_model import (
     Typography,
     VLModelConfig,
 )
-from ppt_clone.spec.theme import extract_theme_colors, extract_theme_fonts, extract_slide_background
+from ppt_clone.spec.theme import (
+    extract_theme_colors,
+    extract_theme_fonts,
+    extract_slide_background,
+    extract_used_colors,
+)
 from ppt_clone.spec.element_extractor import (
     Element,
     extract_element,
@@ -41,8 +46,11 @@ from ppt_clone.spec.element_extractor import (
 from ppt_clone.spec.vision import VLClient
 from ppt_clone.spec.asset_extractor import (
     extract_background_image,
+    extract_page_background,
     extract_shape_assets,
+    annotate_contains,
     AssetInfo,
+    AssetType,
 )
 
 
@@ -196,10 +204,21 @@ class SpecExtractor:
             "format": f"{int(prs.slide_width) // 914400}x{int(prs.slide_height) // 914400}in",
         }
 
+        # Re-extracting the same template must not leave yesterday's assets and
+        # page blueprints behind — a stale bac_*.png next to the fresh ones is
+        # how a replica ends up referencing an image that is no longer used.
+        _fresh_dir(Path("specs") / metadata["name"])
+
         # Theme
         pptx_str = str(pptx_path.absolute())
         theme_colors = extract_theme_colors(pptx_str)
         palette = ColorPalette.from_theme_scheme(theme_colors)
+        # The scheme is only a promise — check what the slides actually paint
+        # with, and fall back to those colours when the theme goes unused.
+        try:
+            palette.apply_dominant(extract_used_colors(pptx_str, theme_colors))
+        except Exception:
+            pass
         # Make scheme colours (accent1, dk1, tx1 …) resolvable during
         # element extraction so fill/stroke/font colours land as real HEX.
         set_theme_colors(theme_colors)
@@ -259,8 +278,42 @@ class SpecExtractor:
                 stype = _detect_layout_sub_type(elements)
                 sub_types.add(stype)
 
-            # ── Background ──
             spec_dir_path = Path("specs") / metadata["name"]
+
+            # ── Shape assets (classify + extract, discard content images) ──
+            # Run this BEFORE the background check: a full-bleed ground is very
+            # often a shape with a picture fill (or a picture inside a group),
+            # and this pass already recurses into groups and image fills.
+            shape_assets: list[AssetInfo] = []
+            img_counter = [0]          # shared per page, so names never collide
+            seen: dict[str, str] = {}  # blob hash -> src, so reuse is one file
+            for shape in slide.shapes:
+                try:
+                    assets = extract_shape_assets(shape, spec_dir_path, idx,
+                                                   slide_w_emu=sw, slide_h_emu=sh,
+                                                   img_counter=img_counter,
+                                                   seen=seen)
+                    shape_assets.extend(assets)
+                except Exception:
+                    pass
+            # One picture reused on several shapes is a single asset, not many.
+            deduped: list[AssetInfo] = []
+            by_src: set[str] = set()
+            for a in shape_assets:
+                if a.src and a.src in by_src:
+                    continue
+                if a.src:
+                    by_src.add(a.src)
+                deduped.append(a)
+            shape_assets = deduped
+            # Two pictures where one frames the other (a photo in a laptop
+            # screen) are a mockup + its inset, not two unrelated photos.
+            try:
+                annotate_contains(shape_assets)
+            except Exception:
+                pass
+
+            # ── Background ──
             bg_result = extract_background_image(slide, spec_dir_path, idx)
             bg_color = bg_result.get("color", "#FFFFFF") if bg_result else "#FFFFFF"
             bg_image = bg_result.get("image", "") if bg_result else ""
@@ -268,15 +321,28 @@ class SpecExtractor:
             bg_desc = bg_result.get("description", "White background") if bg_result else "White background"
             gradient_stops = bg_result.get("gradient_stops", []) if bg_result else []
 
-            # ── Shape assets (classify + extract, discard content images) ──
-            shape_assets: list[AssetInfo] = []
-            for shape in slide.shapes:
-                try:
-                    assets = extract_shape_assets(shape, spec_dir_path, idx,
-                                                   slide_w_emu=sw, slide_h_emu=sh)
-                    shape_assets.extend(assets)
-                except Exception:
-                    pass
+            # Plenty of decks carry no <p:bg> at all and instead lay a
+            # full-bleed image across the slide. Without this the page is
+            # called "white" and the replica loses its ground entirely.
+            if bg_type != "image":
+                ground = next((a for a in shape_assets
+                               if a.src and (a.usage == "background"
+                                             or a.type == AssetType.BACKGROUND)), None)
+                if ground is not None:
+                    bg_type, bg_image = "image", ground.src
+                    bg_desc = f"Full-bleed background image ({ground.description})"
+                else:
+                    # Nothing on the slide — the ground may live on the layout
+                    # or the master instead.
+                    try:
+                        fallback = extract_page_background(slide, spec_dir_path, idx, sw, sh)
+                    except Exception:
+                        fallback = None
+                    if fallback:
+                        bg_type = fallback["type"]
+                        bg_image = fallback["image"]
+                        bg_color = fallback.get("color", "") or bg_color
+                        bg_desc = fallback.get("description", bg_desc)
 
             # Update element image counts
             img_count = sum(1 for e in elements if e.element_type.value == "image")
@@ -309,7 +375,13 @@ class SpecExtractor:
             elif bg_color and bg_color != "#FFFFFF":
                 desc_parts.append(f"Background: {bg_color}.")
             if asset_count > 0:
-                desc_parts.append(f"{asset_count} extracted assets.")
+                # Name what each picture is FOR, not just that it exists.
+                usages: dict[str, int] = {}
+                for a in shape_assets:
+                    if a.src:
+                        usages[a.usage or "asset"] = usages.get(a.usage or "asset", 0) + 1
+                summary = ", ".join(f"{n} {u}" for u, n in sorted(usages.items()))
+                desc_parts.append(f"{asset_count} extracted assets ({summary}).")
             layout_desc = " ".join(desc_parts)
 
             page = PageSpec(
@@ -326,6 +398,7 @@ class SpecExtractor:
                 gradient_stops=gradient_stops,
                 visual_hierarchy=hierarchy,
                 elements=elements,
+                assets=[a.to_dict() for a in shape_assets if a.src],
                 layout_description=layout_desc,
             )
             pages.append(page)
@@ -389,6 +462,19 @@ class SpecExtractor:
         print(f"  Pages: {len(spec.pages)} ({', '.join(spec.page_types_found)})")
         if spec.layout_sub_types_found:
             print(f"  Layouts: {', '.join(spec.layout_sub_types_found)}")
+
+
+def _fresh_dir(spec_dir: Path) -> None:
+    """Clear the generated parts of a spec dir so a re-run starts clean.
+
+    Only ``assets/`` and ``pages/`` are removed — they are pure output of this
+    extractor. A hand-edited ``spec.yaml`` or ``logic.yaml`` is left alone.
+    """
+    import shutil
+    for sub in ("assets", "pages"):
+        d = spec_dir / sub
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def _build_sections(pages: list[PageSpec]) -> list[dict]:
