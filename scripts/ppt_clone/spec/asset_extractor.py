@@ -61,6 +61,7 @@ class AssetInfo:
     contains: str = ""       # src of the picture framed by this one
     inside: str = ""         # src of the frame this picture sits in
     crop: dict = None        # {"cropped": bool, "stretched": bool}
+    rotation: float = 0.0    # degrees; a ground is often laid on a rotated rect
 
     def to_dict(self) -> dict:
         d = {"type": self.type.value, "src": self.src, "description": self.description}
@@ -76,11 +77,26 @@ class AssetInfo:
             d["inside"] = self.inside
         if self.crop:
             d["crop"] = self.crop
+        if self.rotation:
+            d["rotation"] = round(self.rotation, 1)
         return d
 
 
 # A picture covering this much of the canvas is the page's ground, not a prop.
 BACKGROUND_RATIO = 0.88
+
+
+def _rotation_of(shape) -> float:
+    """A shape's rotation in degrees, negative when counter-clockwise.
+
+    A full-bleed ground is frequently a portrait rect turned -90° to cover a
+    landscape slide; without the angle the replica lays the image flat and it
+    comes out stretched.
+    """
+    try:
+        return float(getattr(shape, "rotation", 0.0) or 0.0)
+    except Exception:
+        return 0.0
 
 
 def usage_for(ratio: float) -> str:
@@ -447,6 +463,7 @@ def _extract_picture_asset(picture, spec_dir: Path, page_idx: int,
             size_ratio=ratio,
             usage=usage,
             crop=crop,
+            rotation=_rotation_of(picture),
         )
     except Exception:
         return None
@@ -516,12 +533,15 @@ def extract_page_background(slide, spec_dir: Path, page_idx: int,
             assets_dir.mkdir(parents=True, exist_ok=True)
             filename = f"bg_{page_idx:03d}.{ext}"
             (assets_dir / filename).write_bytes(blob)
+            rot = _rotation_of(shape)
             return {
                 "type": "image",
                 "color": "",
                 "image": f"assets/{filename}",
+                "rotation": rot,
                 "description": (f"Full-bleed background image "
-                                f"({ratio:.0%} of the canvas, from the {source})"),
+                                f"({ratio:.0%} of the canvas, from the {source}"
+                                + (f", rotated {rot:g}°" if rot else "") + ")"),
             }
         return None
 
@@ -668,20 +688,63 @@ def _extract_fill_asset(shape, spec_dir: Path, page_idx: int,
         w = (shape.width or 0) / 914400
         h = (shape.height or 0) / 914400
 
+        fill_crop = _describe_fill_crop(shape, blob)
+        detail = f"{usage} (fill in '{shape.name}'"
+        detail += ", zooms and crops" if fill_crop.get("cropped") else ""
+        detail += ", stretched)" if fill_crop.get("stretched") else ")"
+
         return AssetInfo(
             type=asset_type,
             src=f"assets/{filename}",
             shape_name=shape.name,
             position={"x": round(x, 2), "y": round(y, 2), "w": round(w, 2), "h": round(h, 2)},
-            description=f"{asset_type.value}: {filename} — {usage} (fill in '{shape.name}')",
+            description=f"{asset_type.value}: {filename} — {detail}",
             size_ratio=ratio,
             usage=usage,
+            crop=fill_crop,
+            rotation=_rotation_of(shape),
         )
     except Exception:
         return None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
+
+
+def _describe_fill_crop(shape, blob: bytes) -> dict[str, bool]:
+    """Say whether an image FILL zooms/crops or is stretched to its shape.
+
+    A negative ``<a:fillRect>`` inset overscans the shape — the fill is scaled
+    up and cropped, so the picture keeps its proportions. A plain stretch with
+    no inset distorts it. Getting this wrong is why a ground image can come out
+    squashed.
+    """
+    cropped = False
+    try:
+        xml = shape._element.xml
+        m = re.search(r"<a:fillRect([^/]*)/>", xml)
+        if m:
+            for key in ("l", "t", "r", "b"):
+                v = re.search(rf'{key}="(-?\d+)"', m.group(1))
+                if v and int(v.group(1)) != 0:
+                    cropped = True
+                    break
+    except Exception:
+        pass
+
+    stretched = False
+    if not cropped:
+        try:
+            from PIL import Image
+            nat_w, nat_h = Image.open(io.BytesIO(blob)).size
+            if nat_w and nat_h and shape.width and shape.height:
+                native = nat_w / nat_h
+                placed = shape.width / shape.height
+                stretched = abs(placed - native) / native > 0.02
+        except Exception:
+            pass
+
+    return {"cropped": cropped, "stretched": stretched}
 
 
 def _content_type_to_ext(content_type: str) -> str:

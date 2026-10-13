@@ -46,6 +46,22 @@ def test_full_bleed_picture_becomes_the_background(tmp_path, monkeypatch):
     assert any(a.get("usage") == "background" for a in page.assets)
 
 
+def test_a_rotated_ground_records_its_angle(tmp_path, monkeypatch):
+    """A portrait ground laid on a rect turned -90° must keep that angle."""
+    monkeypatch.chdir(tmp_path)
+
+    def build(prs, slide, tmp):
+        bg = _png(tmp / "bg.png", (94, 55, 28), (900, 1600))   # portrait
+        pic = slide.shapes.add_picture(str(bg), 0, 0,
+                                       width=prs.slide_width, height=prs.slide_height)
+        pic.rotation = 270
+
+    spec = _save(_deck(tmp_path, build), tmp_path, spec_name="rot")
+    ground = next(a for a in spec.pages[0].assets if a.get("usage") == "background")
+
+    assert ground.get("rotation") == 270.0
+
+
 def test_nested_pictures_are_a_mockup_and_its_inset(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 

@@ -86,8 +86,10 @@ def _build_generation_prompt(
 
     # Spec style guidance
     bg_color = spec_page.get("background_color", "#FFFFFF")
-    bg_description = spec_page.get("background_description", "Plain white background")
     background = spec_page.get("background", {}) or {}
+    bg_description = (background.get("description")
+                      or spec_page.get("background_description")
+                      or "Plain white background")
     bg_image = background.get("image", "") or spec_page.get("background_image", "")
     layout_description = spec_page.get("layout_description", "")
     colors = spec_page.get("colors", {})
@@ -153,10 +155,27 @@ def _build_generation_prompt(
 
     # ── Background instruction ──
     if bg_image:
+        # The ground is very often a portrait photo laid on a rect that the
+        # source rotated -90°. State the angle so the replica turns it too —
+        # and always keep the image's own proportions instead of stretching.
+        ground = next((a for a in page_assets
+                       if a.get("src") == bg_image), None)
+        rot = (ground or {}).get("rotation", 0) or 0
+        rot_note = ""
+        if rot:
+            pivot = "rotate(-90 640 360)" if rot < 0 else f"rotate({rot:g} 640 360)"
+            rot_note = (
+                f" The source lays this on a rectangle rotated {rot:g}°: reproduce it as "
+                f"<g transform=\"{pivot}\"><image ... x=\"280\" y=\"-280\" width=\"720\" "
+                f"height=\"1280\" preserveAspectRatio=\"xMidYMid slice\"/></g> so a portrait "
+                f"image covers the landscape page upright."
+            )
         bg_instruction = (
-            f"{bg_description}. FIRST draw the page ground as a full-bleed "
-            f"<image> covering the whole canvas (x=0, y=0, width=1280, "
-            f"height=720) referencing {bg_image}; everything else goes on top."
+            f"{bg_description}. FIRST draw the page ground referencing {bg_image}, "
+            f"covering the whole canvas and everything else on top.{rot_note} "
+            f"IMPORTANT: never stretch the image to fill — keep its aspect ratio "
+            f"(use preserveAspectRatio=\"xMidYMid slice\" to cover and crop), or it "
+            f"comes out squashed."
         )
     else:
         bg_instruction = (
@@ -181,6 +200,8 @@ def _build_generation_prompt(
                 note += ", cropped by the source"
             if crop.get("stretched"):
                 note += ", stretched to fill its box"
+            if a.get("rotation"):
+                note += f", rotated {a['rotation']:g}°"
             pos = a.get("position") or {}
             where = (f" at ({pos.get('x',0):.2f},{pos.get('y',0):.2f}) "
                      f"size {pos.get('w',0):.2f}x{pos.get('h',0):.2f}in") if pos else ""
