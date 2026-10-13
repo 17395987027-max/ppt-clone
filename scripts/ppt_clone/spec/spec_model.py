@@ -1,0 +1,525 @@
+"""Design spec data model — complete design blueprint for PPT reproduction.
+
+Every element captured in this spec must be independently reproducible —
+given this YAML, one should be able to redraw the original slide with
+pixel-level fidelity on style (not content text).
+
+Spec directory:
+  specs/<name>/
+  ├── spec.yaml        # Palette, fonts, page list, logic
+  ├── pages/           # Per-page blueprint YAMLs
+  │   ├── cover/
+  │   ├── toc/
+  │   ├── content/{sub_type}/
+  │   └── end_page/
+  ├── assets/          # Extracted images, backgrounds
+  └── logic.yaml       # Narrative structure
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+
+# ── Enums ───────────────────────────────────────────────────────────
+
+class PageType(str, Enum):
+    COVER = "cover"
+    TOC = "toc"
+    TRANSITION = "transition"
+    CONTENT = "content"
+    END_PAGE = "end_page"
+    BLANK = "blank"
+
+
+class LayoutSubType(str, Enum):
+    LEFT_RIGHT = "left_right"
+    TOP_BOTTOM = "top_bottom"
+    LEFT_MIDDLE_RIGHT = "left_middle_right"
+    FULL_WIDTH = "full_width"
+    GRID = "grid"
+    IMAGE_LEFT = "image_left"
+    IMAGE_RIGHT = "image_right"
+    QUOTE = "quote"
+    CHART = "chart"
+    CUSTOM = "custom"
+
+
+class ElementType(str, Enum):
+    TEXT = "text"
+    IMAGE = "image"
+    SHAPE = "shape"
+    GROUP = "group"
+    TABLE = "table"
+    CHART = "chart"
+    PLACEHOLDER = "placeholder"
+
+
+class SemanticRole(str, Enum):
+    TITLE = "title"
+    SUBTITLE = "subtitle"
+    BODY = "body"
+    FOOTER = "footer"
+    PAGE_NUMBER = "page_number"
+    LOGO = "logo"
+    DECORATION = "decoration"
+    IMAGE = "image"
+    ICON = "icon"
+    ACCENT = "accent"
+    DIVIDER = "divider"
+    HEADER = "header"
+
+
+class DensityLabel(str, Enum):
+    BREATHING = "breathing"
+    DENSE = "dense"
+    ANCHOR = "anchor"
+
+
+# ── Style dataclasses ────────────────────────────────────────────────
+
+
+@dataclass
+class TextStyle:
+    """Complete text formatting specification."""
+    font_family: str = ""
+    font_size_pt: float = 0.0
+    font_weight: str = "normal"     # "normal" | "bold"
+    font_italic: bool = False
+    font_underline: bool = False
+    font_color: str = ""            # HEX, e.g. "#4472C4"
+    text_alignment: str = "left"    # "left" | "center" | "right" | "justify"
+    line_spacing: float = 1.0       # multiplier (1.0 = single, 1.5 = 1.5 lines)
+    letter_spacing: float = 0.0     # pt
+
+    def to_dict(self) -> dict:
+        return {
+            "font_family": self.font_family,
+            "font_size_pt": self.font_size_pt,
+            "font_weight": self.font_weight,
+            "font_italic": self.font_italic,
+            "font_underline": self.font_underline,
+            "font_color": self.font_color,
+            "text_alignment": self.text_alignment,
+            "line_spacing": self.line_spacing,
+            "letter_spacing": self.letter_spacing,
+        }
+
+
+@dataclass
+class ShapeStyle:
+    """Shape/rectangle visual style."""
+    shape_type: str = "rect"        # "rect" | "round_rect" | "circle" | "line" | "triangle" | "arrow" | "parallelogram" | "custom"
+    fill_color: str = ""            # HEX, empty = transparent
+    fill_opacity: float = 1.0
+    fill_type: str = ""             # "" | "solid" | "gradient"
+    fill_gradient: list = field(default_factory=list)  # [{"pos":0-1,"color":"#HEX"}]
+    fill_gradient_angle: float | None = None           # degrees, None = radial/unspecified
+    stroke_color: str = ""          # HEX, empty = no stroke
+    stroke_width_pt: float = 0.0
+    stroke_opacity: float = 1.0     # 0–1
+    corner_radius_pt: float = 0.0   # for round_rect
+
+    def to_dict(self) -> dict:
+        d = {
+            "shape_type": self.shape_type,
+            "fill_color": self.fill_color,
+            "fill_opacity": self.fill_opacity,
+            "stroke_color": self.stroke_color,
+            "stroke_width_pt": self.stroke_width_pt,
+            "corner_radius_pt": self.corner_radius_pt,
+        }
+        if self.stroke_opacity < 1.0:
+            d["stroke_opacity"] = self.stroke_opacity
+        if self.fill_type:
+            d["fill_type"] = self.fill_type
+        if self.fill_gradient:
+            d["fill_gradient"] = self.fill_gradient
+            d["fill_gradient_angle"] = self.fill_gradient_angle
+        return d
+
+
+@dataclass
+class ImageStyle:
+    """Image placement specification."""
+    src: str = ""                   # relative path in assets/
+    original_width_px: int = 0
+    original_height_px: int = 0
+    crop_left: float = 0.0
+    crop_right: float = 0.0
+    crop_top: float = 0.0
+    crop_bottom: float = 0.0
+    brightness: float = 0.0
+    contrast: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "src": self.src,
+            "original_width_px": self.original_width_px,
+            "original_height_px": self.original_height_px,
+            "crop": {
+                "left": self.crop_left,
+                "right": self.crop_right,
+                "top": self.crop_top,
+                "bottom": self.crop_bottom,
+            },
+        }
+
+
+# ── Position ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class Pos:
+    """Normalized position (0–1) in page coordinates."""
+    x: float = 0.0
+    y: float = 0.0
+    w: float = 0.0
+    h: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {"x": round(self.x, 4), "y": round(self.y, 4),
+                "w": round(self.w, 4), "h": round(self.h, 4)}
+
+
+# ── Element — the core unit ──────────────────────────────────────────
+
+
+@dataclass
+class Element:
+    """A single visual element on a slide — fully specified for reproduction."""
+    id: int = 0
+    element_type: ElementType = field(default=ElementType.SHAPE)
+    semantic_role: SemanticRole = field(default=SemanticRole.BODY)
+    position: Pos = field(default_factory=Pos)
+
+    # Content
+    text: str = ""                  # Full text content (not truncated!)
+    text_style: TextStyle | None = None
+    shape_style: ShapeStyle | None = None
+    image_style: ImageStyle | None = None
+
+    # Children (for GROUP elements)
+    children: list[Element] = field(default_factory=list)
+
+    # Metadata
+    z_order: int = 0
+    visible: bool = True
+    shape_name: str = ""            # Original PowerPoint shape name
+    from_layout: bool = False        # inherited from the slide layout (behind slide shapes)
+
+    def to_dict(self) -> dict:
+        d: dict[str, Any] = {
+            "id": self.id,
+            "type": self.element_type.value,
+            "role": self.semantic_role.value,
+            "position": self.position.to_dict(),
+            "z_order": self.z_order,
+        }
+        if self.from_layout:
+            d["from_layout"] = True
+        if self.text:
+            d["text"] = self.text
+        if self.text_style:
+            d["text_style"] = self.text_style.to_dict()
+        if self.shape_style:
+            d["shape_style"] = self.shape_style.to_dict()
+        if self.image_style:
+            d["image_style"] = self.image_style.to_dict()
+        if self.children:
+            d["children"] = [c.to_dict() for c in self.children]
+        if self.shape_name:
+            d["shape_name"] = self.shape_name
+        return d
+
+
+# ── Page spec — complete slides blueprint ────────────────────────────
+
+
+@dataclass
+class PageSpec:
+    """Complete page blueprint — everything needed to redraw this slide."""
+    page_type: PageType = field(default=PageType.CONTENT)
+    layout_sub_type: LayoutSubType = field(default=LayoutSubType.FULL_WIDTH)
+
+    # Canvas
+    width_emu: int = 0
+    height_emu: int = 0
+    width_inches: float = 0.0
+    height_inches: float = 0.0
+
+    # Background
+    background_color: str = ""
+    background_image: str = ""
+    background_type: str = "solid"
+    background_description: str = ""
+    gradient_stops: list[dict] = field(default_factory=list)
+
+    # Visual hierarchy summary
+    visual_hierarchy: list[str] = field(default_factory=list)
+    # ["title: 等线 Light 36pt bold #000000", "body: 等线 14pt #333333", "footer: 等线 10pt #999999"]
+
+    # Elements
+    elements: list[Element] = field(default_factory=list)
+
+    # Descriptive
+    layout_description: str = ""
+
+    @property
+    def element_count(self) -> int:
+        return len(self.elements)
+
+    def to_dict(self) -> dict:
+        return {
+            "page_type": self.page_type.value,
+            "layout_sub_type": self.layout_sub_type.value,
+            "canvas": {
+                "width_emu": self.width_emu,
+                "height_emu": self.height_emu,
+                "width_inches": round(self.width_inches, 2),
+                "height_inches": round(self.height_inches, 2),
+            },
+            "background": {
+                "type": self.background_type,
+                "color": self.background_color,
+                "image": self.background_image,
+                "description": self.background_description,
+                "gradient_stops": self.gradient_stops,
+            },
+            "visual_hierarchy": self.visual_hierarchy,
+            "layout_description": self.layout_description,
+            "elements": [e.to_dict() for e in self.elements],
+        }
+
+
+# ── Color & Typography ──────────────────────────────────────────────
+
+
+@dataclass
+class ColorPalette:
+    accent1: str = ""
+    accent2: str = ""
+    accent3: str = ""
+    accent4: str = ""
+    accent5: str = ""
+    accent6: str = ""
+    dark1: str = ""      # Usually background
+    dark2: str = ""
+    light1: str = ""     # Usually text
+    light2: str = ""
+    hyperlink: str = ""
+    followed_hyperlink: str = ""
+
+    # Backward-compat aliases
+    @property
+    def background1(self): return self.dark1
+    @background1.setter
+    def background1(self, v): self.dark1 = v
+    @property
+    def background2(self): return self.dark2
+    @background2.setter
+    def background2(self, v): self.dark2 = v
+    @property
+    def text1(self): return self.light1
+    @text1.setter
+    def text1(self, v): self.light1 = v
+    @property
+    def text2(self): return self.light2
+    @text2.setter
+    def text2(self, v): self.light2 = v
+
+    def to_dict(self) -> dict[str, str]:
+        return {k: v for k, v in self.__dict__.items() if v}
+
+    @classmethod
+    def from_theme_scheme(cls, scheme_colors: dict[str, str]) -> ColorPalette:
+        return cls(
+            dark1=scheme_colors.get("dk1", ""),
+            dark2=scheme_colors.get("dk2", ""),
+            light1=scheme_colors.get("lt1", ""),
+            light2=scheme_colors.get("lt2", ""),
+            accent1=scheme_colors.get("accent1", ""),
+            accent2=scheme_colors.get("accent2", ""),
+            accent3=scheme_colors.get("accent3", ""),
+            accent4=scheme_colors.get("accent4", ""),
+            accent5=scheme_colors.get("accent5", ""),
+            accent6=scheme_colors.get("accent6", ""),
+            hyperlink=scheme_colors.get("hlink", ""),
+            followed_hyperlink=scheme_colors.get("folHlink", ""),
+        )
+
+
+@dataclass
+class Typography:
+    heading_family: str = ""
+    body_family: str = ""
+    heading_sizes: dict = field(default_factory=dict)
+    body_sizes: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {"heading_family": self.heading_family, "body_family": self.body_family}
+
+
+# ── Logic ────────────────────────────────────────────────────────────
+
+
+@dataclass
+class PresentationLogic:
+    page_sequence: list[str] = field(default_factory=list)
+    sections: list[dict] = field(default_factory=list)
+    narrative_pattern: str = ""
+    story_arc: dict[str, int] = field(default_factory=dict)
+    density_sequence: list[str] = field(default_factory=list)
+    transition_style: str = ""
+    avg_content_per_page: int = 0
+
+    @property
+    def density_profile(self): return self.density_sequence
+
+    @property
+    def sequencing_pattern(self): return self.page_sequence
+
+    def to_dict(self) -> dict:
+        return {
+            "page_sequence": self.page_sequence,
+            "sections": self.sections,
+            "narrative_pattern": self.narrative_pattern,
+            "story_arc": self.story_arc,
+            "density_sequence": self.density_sequence,
+            "transition_style": self.transition_style,
+            "avg_content_per_page": self.avg_content_per_page,
+        }
+
+
+# ── Root Spec ────────────────────────────────────────────────────────
+
+
+@dataclass
+class DesignSpec:
+    metadata: dict = field(default_factory=dict)
+    palette: ColorPalette = field(default_factory=ColorPalette)
+    typography: Typography = field(default_factory=Typography)
+    pages: list[PageSpec] = field(default_factory=list)
+    logic: PresentationLogic = field(default_factory=PresentationLogic)
+    page_types_found: list[str] = field(default_factory=list)
+    layout_sub_types_found: list[str] = field(default_factory=list)
+
+    # Legacy fields for backward compatibility
+    slides_legacy: list = field(default_factory=list)
+    source_config: dict = field(default_factory=dict)
+
+    # Backward-compat properties
+    @property
+    def colors(self): return self.palette
+
+    @colors.setter
+    def colors(self, v): self.palette = v
+
+    @property
+    def slides(self): return self.slides_legacy or self.pages
+
+    @slides.setter
+    def slides(self, v): self.slides_legacy = v
+
+    @property
+    def rhythm(self): return self.logic
+
+    @rhythm.setter
+    def rhythm(self, v): self.logic = v
+
+    def to_dict(self) -> dict:
+        # Build backward-compatible dict with old field names
+        rhythm_data = {
+            "sequencing_pattern": self.logic.sequencing_pattern,
+            "density_profile": self.logic.density_profile,
+            "story_arc": self.logic.story_arc,
+        }
+        slides_data = []
+        for i, s in enumerate(self.slides):
+            item = {"slide_index": getattr(s, 'slide_index', i)}
+            if hasattr(s, 'slide_type'):
+                st = s.slide_type
+                item["slide_type"] = st.value if hasattr(st, 'value') else str(st)
+            elif hasattr(s, 'page_type'):
+                item["page_type"] = s.page_type.value
+            if hasattr(s, 'density'):
+                d = s.density
+                item["density"] = d.value if hasattr(d, 'value') else str(d)
+            if hasattr(s, 'layout_name'): item["layout_name"] = s.layout_name
+            slides_data.append(item)
+        return {
+            "metadata": self.metadata,
+            "colors": self.palette.to_dict(),
+            "typography": self.typography.to_dict(),
+            "rhythm": rhythm_data,
+            "slides": slides_data,
+            "page_types_found": self.page_types_found,
+            "layout_sub_types_found": self.layout_sub_types_found,
+            "source_config": self.source_config,
+        }
+
+
+# ── VL config ────────────────────────────────────────────────────────
+
+
+@dataclass
+class VLModelConfig:
+    provider: str = "openai"
+    model: str = "gpt-4o"
+    api_key: str = ""
+    api_base: str = ""
+    max_tokens: int = 4096
+    temperature: float = 0.1
+    enabled: bool = False
+
+
+# ── Legacy compatibility ─────────────────────────────────────────────
+
+class SlideType(str, Enum):
+    TITLE = "title"
+    CONTENT = "content"
+    SECTION_DIVIDER = "section_divider"
+    IMAGE_TEXT = "image_text"
+    DATA = "data"
+
+@dataclass
+class SlideSpec:
+    """Legacy per-slide spec (Phase 2). Prefer PageSpec going forward."""
+    slide_index: int = 0
+    slide_type: SlideType = field(default=SlideType.CONTENT)
+    layout_name: str = ""
+    density: DensityLabel = field(default=DensityLabel.DENSE)
+    char_count: int = 0
+    image_count: int = 0
+    shape_count: int = 0
+    background: dict | None = None
+
+@dataclass
+class LayoutMargins:
+    """Legacy layout margins."""
+    top: float = 0.0; bottom: float = 0.0; left: float = 0.0; right: float = 0.0
+    title_x: float = 0.0; title_y: float = 0.0; title_width: float = 0.0; title_height: float = 0.0
+
+@dataclass
+class SlideLayoutSpec:
+    """Legacy slide layout spec."""
+    slide_type: SlideType = field(default=SlideType.CONTENT)
+    margins: LayoutMargins = field(default_factory=LayoutMargins)
+    title_position: dict = field(default_factory=dict)
+    content_positions: list = field(default_factory=list)
+
+PresentationRhythm = PresentationLogic
+
+
+__all__ = [
+    "ColorPalette", "DensityLabel", "DesignSpec",
+    "Element", "ElementType", "ImageStyle",
+    "LayoutMargins", "LayoutSubType",
+    "PageSpec", "PageType",
+    "Pos", "PresentationLogic", "PresentationRhythm",
+    "SemanticRole", "ShapeStyle", "SlideLayoutSpec", "SlideSpec",
+    "SlideType", "TextStyle", "Typography", "VLModelConfig",
+]
